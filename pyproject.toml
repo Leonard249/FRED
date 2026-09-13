@@ -1,0 +1,13 @@
+[project]
+name = "fred"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "google-api-python-client>=2.200.0",
+    "google-auth-httplib2>=0.4.2",
+    "google-auth-oauthlib>=1.4.1",
+    "mlx-lm>=0.31.3",
+    "rich>=15.0.0",
+]
