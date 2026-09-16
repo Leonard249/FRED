@@ -161,3 +161,82 @@ F.R.E.D. dynamically boots into different modes depending on launch flags:
 4. **Phase 4 — Tool Integration (Gmail & Web):** Implement OAuth2 read-only Gmail tools and draft proposals. Wire DuckDuckGo/Tavily search nodes.
 5. **Phase 5 — Speech Pipeline:** Integrate `faster-whisper` STT and `Piper` TTS over the core engine. Benchmark latency on the M4 chip.
 6. **Phase 6 — Audit & HITL Hardening:** Ensure SQLite logs record all tool executions, and verify that write actions cannot bypass human approval.
+
+---
+
+## 7. F.R.E.D. Project Hierarchy (MCP Integration)
+
+This structure enforces a clean **Separation of Concerns**: UI, AI reasoning, and Tool execution all live in their own dedicated boundaries.
+
+```text
+FRED/
+├── pyproject.toml              # Managed by `uv` (contains dependencies like mlx, langgraph, rich)
+├── README.md                   # Your architectural design document
+├── credentials/                # Your OAuth credentials (make sure this is in .gitignore!)
+│   ├── credentials.json
+│   └── token.json
+│
+├── mcp_servers/                # 🛠️ THE HANDS: Independent local servers (Model Context Protocol)
+│   └── gmail_mcp/
+│       ├── __init__.py
+│       ├── server.py           # Your read_gmail.py adapted into an MCP Server
+│       └── auth.py             # OAuth lifecycle logic
+│
+└── fred/                       # 🧠 THE BRAIN: Main application package
+    ├── __init__.py
+    ├── main.py                 # Entrypoint: `uv run fred.py --mode [cli|web|app]`
+    │
+    ├── core/                   # Orchestration (LangGraph)
+    │   ├── graph.py            # Defines the LangGraph Nodes and conditional Edges
+    │   ├── state.py            # Defines the shared TypedDict state between agents
+    │   └── hitl.py             # Human-in-the-Loop logic and SQLite audit logging
+    │
+    ├── memory/                 # Memory Management (Cognitive Hierarchy)
+    │   ├── checkpointer.py     # Episodic: Configures LangGraph SqliteSaver
+    │   ├── vector_store.py     # Semantic: ChromaDB wrapper for facts & entities
+    │   ├── playbooks/          # Procedural: Folder for agent-written markdown guides
+    │   └── consolidator.py     # Short/Long-Term: Rolling summaries & reflection logic
+    │
+    ├── models/                 # Model Management (M4 24GB Logic)
+    │   ├── manager.py          # The JIT swapper (`gc.collect()`, `mx.metal.clear_cache()`)
+    │   ├── supervisor.py       # Qwen3-8B-DWQ initialization and structured output parsing
+    │   ├── coder.py            # Qwen3-Coder integration
+    │   └── vision.py           # Qwen3-VL integration
+    │
+    ├── tools/                  # Tool Calling & External connections
+    │   └── mcp_client.py       # Connects LangGraph to your local MCP Servers
+    │
+    ├── pipeline/               # Pre-processing (Runs before LLM sees prompt)
+    │   ├── normalizer.py       # fastText language ID & translation routing
+    │   └── slang.py            # ChromaDB lookup for Singlish/internet slang
+    │
+    └── interfaces/             # UX / UI Layer
+        ├── cli.py              # `rich` terminal UI (Claude Code style)
+        ├── web.py              # `gradio` chatbot UI (Drag-and-drop images)
+        └── tauri_app/          # (Optional) Desktop app wrapper configuration
+```
+
+---
+
+## 8. Cognitive Memory Hierarchy
+
+F.R.E.D. implements a tiered memory system to decouple context from reasoning, ensuring the Supervisor's 8K context window remains lean and latency stays low.
+
+### 8.1 Short-Term Memory (Working Memory)
+
+- **Sliding Window + Rolling Summary:**
+  Raw chat history is strictly capped at the last $N$ turns (e.g., 6 messages). Older messages are not deleted; they are compressed via a background prompt into a dense `working_summary` string that is prepended to the system prompt.
+- **Agentic Scratchpad:**
+  The LangGraph state maintains a `task_plan` (Supervisor's step-by-step strategy) and a `scratchpad` (internal notes on failed tool executions) to prevent cyclical hallucination loops.
+
+### 8.2 Long-Term Memory (LTM)
+
+LTM is not automatically injected (to prevent context bloat). It is accessed via **Agentic Retrieval** (explicit tool calls by the Supervisor).
+
+- **Semantic Memory (Facts):** Stored in a ChromaDB collection (`semantic_kb`). Retrieved via `query_facts()`. Uses **Time-Weighted Vector Retrieval** to prioritize semantic relevance combined with a recency decay penalty, ensuring F.R.E.D. favors the latest version of a fact.
+- **Episodic Memory (Experience):** Powered by LangGraph's native `SqliteSaver`. Captures full conversational states allowing users to say, "Resume what we were working on yesterday."
+- **Procedural Memory (Skills):** Stored in `fred/memory/playbooks/` as Markdown. When the Coder agent figures out a complex terminal setup, it synthesizes the steps into a playbook. Retrieved via `query_playbooks()`.
+
+### 8.3 Continuous Learning Loop
+
+F.R.E.D. runs a background **Memory Consolidation Node** after a task completes. It extracts new entities, corrects outdated information, and executes `insert_fact` or `delete_fact` tool calls against ChromaDB to refine its own knowledge base independently of user interaction.
