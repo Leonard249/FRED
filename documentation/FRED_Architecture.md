@@ -1,242 +1,206 @@
 # F.R.E.D. (Fairly Reliable Engine Doing Deeds)
 
-_A privacy-first, local-first multimodal assistant & agentic workspace for Apple Silicon._
+_A privacy-first, local-first multimodal assistant & agentic workspace for Apple Silicon (M4, 24 GB)._
 
 ---
 
 ## 0. Reality Check & Core Architectural Invariants
 
-F.R.E.D. operates under strict design tensions that dictate every engineering trade-off:
+F.R.E.D. operates under strict hardware and design invariants:
 
 1. **"100% Local Inference" vs. "Chain-of-Thought Quality & Calibrated Confidence":**  
-   Small local models (7B–14B) struggle with faithful chain-of-thought traces and calibrated self-reported confidence. Rather than trusting self-reported numbers, F.R.E.D. enforces grammar-constrained schemas and multi-sample self-consistency checks.
-2. **The 24 GB Unified Memory Ceiling & Dynamic Model Swapping:**  
-   On an M4 Mac with 24 GB unified RAM, holding three 8B models (Supervisor, Coder, Vision) in memory concurrently requires 23–27 GB (including macOS and KV caches), triggering severe SSD swap-thrashing. F.R.E.D. resolves this via **Just-In-Time (JIT) Model Swapping** and Metal cache flushing.
+   Small local models (3B–8B) struggle with faithful self-reported confidence. Rather than trusting self-assessment scores, F.R.E.D. enforces grammar-constrained schemas and multi-sample self-consistency checks.
+2. **Deterministic Memory Budgeting (24 GB M4):**  
+   Target models are chosen and benchmarked so their combined weights (~11.02 GB) plus macOS baseline (~5.0 GB) remain safely below the 24 GB ceiling, reserving ~7.5 GB for dynamic KV caches and Metal workspaces without SSD swap-thrashing.
 3. **Local-First, Scoped Web Access:**  
-   Private data (voice audio, personal documents, calendar, Gmail, Telegram, financial exports) never leaves the local machine. External web retrieval (DuckDuckGo or Tavily) is reasoning-gated, domain-scoped, hop-capped (3–5 hops), and logged as an explicit tool call.
+   Private data (voice, personal documents, calendar, Gmail, Telegram, banking exports) never leaves the local machine. External web retrieval (DuckDuckGo or Tavily) and web parsing (`trafilatura`) are reasoning-gated, domain-scoped, hop-capped (3–5 hops), and logged.
 4. **Architectural Invariant — Non-Bypassable HITL:**  
-   The LangGraph state machine enforces an unconditional edge before any node executing an external write (Gmail sending, Calendar modification). The model is architecturally prevented from bypassing user confirmation.
+   The LangGraph state machine enforces an unconditional human-in-the-loop (HITL) review edge before executing any external write action (e.g., sending an email or altering a calendar event).
 5. **Zero Filesystem Write Permissions:**  
-   F.R.E.D. possesses zero direct filesystem write/delete access. Workspace code modifications are strictly emitted as proposed unified diffs for manual review and application.
+   F.R.E.D. possesses zero direct filesystem write/delete access. Workspace modifications are strictly emitted as unified diff proposals for manual review.
 
 ---
 
-## 1. System Architecture: Modular Pipeline vs. True MAS
+## 1. 3-Tier Adaptive Agent Architecture
 
-F.R.E.D. bridges two operational paradigms depending on user task complexity:
-
-- **Mode A: Event-Driven Modular Dispatch (Default):**  
-  Deterministic triggers (CLI startup, image drag-and-drop) directly invoke specialized models without inter-agent deliberation overhead. Keeps latency low and memory footprint lean.
-- **Mode B: True Multi-Agent System (MAS) with Actor-Critic Loops:**  
-  When high-level tasks demand cross-modal collaboration (e.g., extracting an error screenshot from Gmail, feeding it to Vision, dispatching a patch task to Coder, and validating via test execution), models communicate using an **Agent2Agent (A2A)** JSON schema with a hard cap of 2 refinement iterations.
+To maximize response speed while preventing context drift and infinite loops, F.R.E.D. routes tasks to one of three execution tiers based on task complexity:
 
 ```text
-                    ┌────────────────────────────────────────────────────────┐
-                    │                 MACBOOK PRO M4 (24 GB)                 │
-                    │                                                        │
- [Voice/Text/Image]─┤► Multi-Interface Entrypoint (--cli, --web, --app)      │
-                    │         │                                              │
-                    │         ▼                                              │
-                    │ Bilingual Normalization (fastText + Slang Index)       │
-                    │         │                                              │
-                    │         ▼                                              │
-                    │ 👑 SUPERVISOR AGENT (Qwen3-8B-DWQ via mlx-lm)          │
-                    │ Intent Parser, Confidence Gate & LangGraph Router      │
-                    │   ├── < threshold ──► Ask for clarification            │
-                    │   └── ≥ threshold ──► Route to Specialist/Tool         │
-                    │         │                                              │
-                    │   ┌─────┼─────────────────────┬────────────────────┐   │
-                    │   ▼     ▼                     ▼                    ▼   │
-                    │ 👁️ VISION AGENT         💻 CODER AGENT      🌐 SEARCH AGENT │
-                    │ (Qwen3-VL-8B/4B)       (Qwen3-Coder via MLX)(Tavily/DDG)   │
-                    │ JIT loaded on image    JIT loaded on diff   Current info,  │
-                    │ analysis               request              Page retrieval │
-                    │   │     │                     │                    │   │
-                    │   └─────┴─────────┬───────────┴────────────────────┘   │
-                    │                   ▼                                    │
-                    │     Action Routing & Classification                    │
-                    │       ├── Read-Only / Informational                    │
-                    │       │     ├── Stream to CLI / Web App                │
-                    │       │     └── Local TTS (Piper / Kokoro-82M)         │
-                    │       │                                                │
-                    │       └── External Write Actions (Send / Schedule)     │
-                    │             │                                          │
-                    │             ▼                                          │
-                    │       [NON-BYPASSABLE HITL APPROVAL NODE]              │
-                    │       Shows complete draft in UI/CLI                   │
-                    │       Requires explicit "confirm" before API execution │
-                    └────────────────────────────────────────────────────────┘
-
+                        ┌─────────────────────────────────┐
+                        │      USER PROMPT / TASK         │
+                        └────────────────┬────────────────┘
+                                         │
+                                         ▼
+                      ┌─────────────────────────────────────┐
+                      │    👑 SUPERVISOR CLASSIFIER         │
+                      │    (Qwen3-8B Intent & Complexity)   │
+                      └──────┬───────────┼───────────┬──────┘
+                             │           │           │
+           ┌─────────────────┘           │           └──────────────────┐
+           ▼                             ▼                              ▼
+    [ TIER 1: ReAct ]           [ TIER 2: Plan + Exec ]        [ TIER 3: Reflexion ]
+    • Simple lookups            • Multi-modal chains           • Code synthesis & diffs
+    • Single tool calls         • Sequential DAG workflows     • Local syntax & test check
+    • Sub-second / low latency  • Replanning upon failure      • Actor-Critic self-repair loop
 ```
 
+- **Tier 1: Fast ReAct (Thought → Action → Observation):**  
+  Direct, low-latency execution for single-step requests (`read_calendar_events`, single-file grep, conversational queries).
+- **Tier 2: Plan-and-Execute (Planner → Executor → Replanner):**  
+  Decomposes multi-step, multi-modal workflows into a directed acyclic graph (DAG). For example: inspecting a newsletter label in Gmail, extracting an article URL, parsing the web page via `trafilatura`, and analyzing an embedded architecture diagram with the Vision agent.
+- **Tier 3: Reflexion (Actor → Evaluator → Critique Loop):**  
+  Specialized for code generation and bug fixes. The Coder Agent proposes a diff, an automated evaluator checks it locally (`ruff check` or `pytest` via `execute_safe_command`), and if it fails, the error trace triggers an explicit self-critique loop (hard-capped at 2 iterations).
+
 ---
 
-## 2. Memory Budget & Dynamic Model Swapping (24 GB M4)
+## 2. Benchmark-Validated Memory Budget (M4, 24 GB RAM)
 
-### 2.1 RAM Budget Breakdown
+Physical memory benchmarks for F.R.E.D.'s selected local model roster:
 
-| Component                                      | RAM Footprint | Lifecycle                                |
-| ---------------------------------------------- | ------------- | ---------------------------------------- |
-| **macOS & System WindowServer**                | ~4.5 – 5.5 GB | Permanent                                |
-| **Supervisor (`Qwen3-8B-DWQ` 4-bit)**          | ~5.2 GB       | Permanent Resident                       |
-| **STT / TTS / ChromaDB**                       | ~1.2 – 1.5 GB | Resident / Standby                       |
-| **Active Specialist Worker (Coder or Vision)** | ~4.5 – 6.5 GB | JIT Loaded (Evicted when task completes) |
-| **Dynamic Headroom & KV Caches**               | ~5.5 – 7.5 GB | Safety buffer against SSD swapping       |
+| Role                    | Model Identifier                               | Quantization | RAM Usage     |
+| :---------------------- | :--------------------------------------------- | :----------- | :------------ |
+| **Supervisor**          | `mlx-community/Qwen3-8B-4bit-DWQ-053125`       | 4-bit DWQ    | ~4.73 GB      |
+| **VLM (Vision)**        | `mlx-community/Qwen3-VL-4B-Instruct-5bit`      | 5-bit        | ~2.89 GB      |
+| **Coder**               | `mlx-community/Qwen2.5-Coder-3B-Instruct-8bit` | 8-bit        | ~3.40 GB      |
+| **Total Model Weights** | —                                              | —            | **~11.02 GB** |
 
-### 2.2 Memory Optimization Strategies
+### System Memory Map
 
-1. **Explicit Metal Cache Eviction:** Python's garbage collector does not automatically release Metal allocations. On specialist unloads, F.R.E.D. executes:
-
-```python
-del active_worker
-gc.collect()
-mlx.core.metal.clear_cache()
-
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│                        24 GB UNIFIED MEMORY                            │
+├───────────────────┬───────────────────────────────┬────────────────────┤
+│ macOS & Services  │ All 3 Active Models           │ Dynamic Headroom   │
+│ (~5.0 – 5.5 GB)   │ (~11.02 GB Weights)           │ (~7.5 – 8.0 GB)    │
+│                   │ Qwen3-8B + Qwen3-VL + Coder3B │ KV Caches & Metal  │
+└───────────────────┴───────────────────────────────┴────────────────────┘
 ```
 
-2. **Quantized KV Caches:** All inference runtimes enable `--kv-bits 4` to shrink KV cache footprints by up to 75% on large context windows.
-3. **Context Length Caps:** The resident Supervisor is capped at an 8k context window, reserving wider 32k–64k allocations strictly for the Coder agent during repository traversal.
-4. **Lightweight Vision Alternative:** Option to run `Qwen3-VL-4B` (~2.2 GB), allowing both Supervisor and Vision models to stay co-resident in RAM simultaneously.
+- **KV Cache Control:** Quantized KV cache enabled (`--kv-bits 4`) across runtimes to prevent long-context memory bloat.
+- **Context Caps:** Supervisor context window is capped at 8,192 tokens for orchestration, reserving larger context allowances for repository traversal in the Coder agent.
+- **Metal Cache Scrubbing:** Explicit eviction (`gc.collect()` and `mlx.core.metal.clear_cache()`) clears temporary tensor buffers after heavy multi-step loops.
 
 ---
 
-## 3. Omnichannel Interfaces
+## 3. Cognitive Memory Hierarchy
 
-F.R.E.D. dynamically boots into different modes depending on launch flags:
+F.R.E.D. separates active working context from long-term storage to keep prompts small and token generation fast:
 
-- **CLI Mode (`uv run fred.py --mode cli`):** Claude Code-style terminal environment powered by `rich`. Supports streaming reasoning traces, Markdown-rendered syntax blocks, interactive diff reviews, and optional voice toggle.
-- **Web Mode (`uv run fred.py --mode web`):** Local Gradio web interface featuring drag-and-drop image uploads for screenshots, UI mocks, and error captures.
-- **App Mode (`uv run fred.py --mode app`):** Lightweight local desktop wrapper (Tauri) pointing to the local backend, allowing persistent docking on macOS.
+### 3.1 Short-Term Memory (STM)
 
----
+- **Sliding Window + Rolling Summary:** Raw message history preserves the most recent $N$ turns (e.g., 6 messages). Older messages are compressed by a background summarizer node into a persistent `working_summary` prepended to the prompt.
+- **Agentic Scratchpad:** LangGraph state maintains a `task_plan` and `scratchpad` to track tool evaluations, preventing circular failure loops.
 
-## 4. Tool Definitions & Constraints
+### 3.2 Long-Term Memory (LTM)
 
-### Personal Communications & Context
+Long-term memory is retrieved explicitly via tool calls rather than indiscriminately injected into every turn:
 
-- `read_gmail_inbox` / `get_email_thread`: Read-only OAuth2 scope (`gmail.readonly`) to inspect messages and unread threads.
-- `read_calendar_events`: Read-only Google Calendar API access to inspect upcoming agendas and check conflicts.
-- `read_telegram_messages`: Read-only context extraction via Telethon.
-- `draft_communication` / `propose_calendar_event`: Generates draft payloads. Strictly non-executable without passing the HITL approval gate.
+- **Semantic Memory (Facts):** ChromaDB collection (`semantic_kb`) scored using **Time-Weighted Vector Retrieval** (semantic similarity combined with a recency decay penalty) via `query_facts()`.
+- **Episodic Memory (Past Interactions):** Durable conversational history saved via LangGraph's native SQLite checkpointer (`SqliteSaver`), enabling task resumption across sessions.
+- **Procedural Memory (Playbooks):** Reusable execution playbooks stored in `fred/memory/playbooks/` as Markdown documents, retrieved via `query_playbooks()`.
 
-### Local Workspace (Claude Code Style)
+### 3.3 Continuous Learning Loop
 
-- `view_file` & `list_directory`: Inspects source files, project structure, and file trees.
-- `search_files_grep`: Regex-based file and content searches across the project tree.
-- `propose_code_diff`: Produces unified diff proposals. F.R.E.D. cannot write, modify, or delete files directly on disk.
-- `execute_safe_command`: Sandboxed read-only terminal execution (`git status`, `git diff`, `pytest`, `python --version`).
-
-### Memory, Data & Scoped Web Access
-
-- `query_local_knowledge`: Vector retrieval over local documents using ChromaDB.
-- `query_financial_records`: Local analytics parsing of offline CSV/OFX banking exports.
-- `search_web_duckduckgo` / `search_web_tavily`: Logged external search queries with engine toggle.
-- `read_web_page`: 2-tier extractor (`trafilatura` static GET → Playwright JS fallback). Capped at 3–5 hops and treated strictly as untrusted data.
+Following task completion, an asynchronous **Memory Consolidation Node** extracts new entities and updates or invalidates outdated facts in ChromaDB without adding latency to the primary user interaction.
 
 ---
 
-## 5. Technology Stack Summary
-
-| Layer                     | Technology                                    | Justification                                                  |
-| ------------------------- | --------------------------------------------- | -------------------------------------------------------------- |
-| **Package Manager**       | `uv`                                          | Deterministic, sub-second dependency management                |
-| **Target Hardware**       | Apple Silicon M4 (24 GB Unified RAM)          | High unified memory bandwidth for native MLX execution         |
-| **Inference Runtime**     | `mlx-lm` / `mlx-vlm`                          | Native Metal acceleration with dynamic JIT model swapping      |
-| **Supervisor Model**      | `Qwen3-8B-DWQ` (4-bit)                        | Permanent resident model for intent parsing and routing        |
-| **Vision / Coder Models** | `Qwen3-VL` / `Qwen3-Coder`                    | Dynamically loaded specialist agents                           |
-| **Orchestrator**          | LangGraph                                     | State machine with non-bypassable HITL routing                 |
-| **UI Suite**              | `rich` (CLI) + `gradio` (Web) + `tauri` (App) | Omnichannel interaction suite                                  |
-| **Search Engine**         | DuckDuckGo / Tavily                           | Configurable zero-cost vs. agent-optimized search              |
-| **STT / TTS**             | `faster-whisper` + `Piper` / `Kokoro-82M`     | Low-latency local speech pipeline                              |
-| **Vector DB**             | ChromaDB                                      | Local on-disk vector store                                     |
-| **Auditing & Logs**       | SQLite                                        | Immutable local audit logging for all tool calls and approvals |
-
----
-
-## 6. Phased Implementation Roadmap
-
-1. **Phase 1 — Single-Agent CLI Core:** Initialize environment with `uv`. Configure `mlx-lm` with Qwen3-8B-DWQ. Build the interactive `rich` CLI and implement LangGraph confidence gating.
-2. **Phase 2 — JIT Model Swapping & Workspace Tools:** Implement dynamic model manager (`gc.collect()` + `mx.metal.clear_cache()`). Connect Qwen3-Coder for workspace tools (`view_file`, `grep`, `propose_code_diff`) and Qwen3-VL via `mlx-vlm`.
-3. **Phase 3 — UI Modularity:** Abstract frontend logic to support `--cli`, `--web` (Gradio), and `--app` (Tauri wrapper) launch modes.
-4. **Phase 4 — Tool Integration (Gmail & Web):** Implement OAuth2 read-only Gmail tools and draft proposals. Wire DuckDuckGo/Tavily search nodes.
-5. **Phase 5 — Speech Pipeline:** Integrate `faster-whisper` STT and `Piper` TTS over the core engine. Benchmark latency on the M4 chip.
-6. **Phase 6 — Audit & HITL Hardening:** Ensure SQLite logs record all tool executions, and verify that write actions cannot bypass human approval.
-
----
-
-## 7. F.R.E.D. Project Hierarchy (MCP Integration)
-
-This structure enforces a clean **Separation of Concerns**: UI, AI reasoning, and Tool execution all live in their own dedicated boundaries.
+## 4. F.R.E.D. Project Hierarchy (MCP-Ready)
 
 ```text
 FRED/
-├── pyproject.toml              # Managed by `uv` (contains dependencies like mlx, langgraph, rich)
-├── README.md                   # Your architectural design document
-├── credentials/                # Your OAuth credentials (make sure this is in .gitignore!)
+├── pyproject.toml              # Managed by `uv`
+├── README.md                   # System specification & architecture
+├── credentials/                # Local OAuth keys (in .gitignore)
 │   ├── credentials.json
 │   └── token.json
 │
 ├── mcp_servers/                # 🛠️ THE HANDS: Independent local servers (Model Context Protocol)
 │   └── gmail_mcp/
 │       ├── __init__.py
-│       ├── server.py           # Your read_gmail.py adapted into an MCP Server
-│       └── auth.py             # OAuth lifecycle logic
+│       ├── server.py           # Gmail tools exposed via standard MCP
+│       └── auth.py             # OAuth lifecycle management
 │
 └── fred/                       # 🧠 THE BRAIN: Main application package
     ├── __init__.py
-    ├── main.py                 # Entrypoint: `uv run fred.py --mode [cli|web|app]`
+    ├── main.py                 # Application entrypoint (`uv run fred.py --mode [cli|web|app]`)
     │
     ├── core/                   # Orchestration (LangGraph)
-    │   ├── graph.py            # Defines the LangGraph Nodes and conditional Edges
-    │   ├── state.py            # Defines the shared TypedDict state between agents
-    │   └── hitl.py             # Human-in-the-Loop logic and SQLite audit logging
+    │   ├── graph.py            # LangGraph nodes, router, and edges
+    │   ├── state.py            # TypedDict state schemas across all tiers
+    │   └── hitl.py             # Non-bypassable approval gates & audit logs
     │
-    ├── memory/                 # Memory Management (Cognitive Hierarchy)
-    │   ├── checkpointer.py     # Episodic: Configures LangGraph SqliteSaver
-    │   ├── vector_store.py     # Semantic: ChromaDB wrapper for facts & entities
-    │   ├── playbooks/          # Procedural: Folder for agent-written markdown guides
-    │   └── consolidator.py     # Short/Long-Term: Rolling summaries & reflection logic
+    ├── memory/                 # Cognitive Memory Subsystem
+    │   ├── checkpointer.py     # Episodic: LangGraph SQLite state saver
+    │   ├── vector_store.py     # Semantic: ChromaDB wrapper with time-weighted decay
+    │   ├── playbooks/          # Procedural: Agent markdown playbooks
+    │   └── consolidator.py     # Background reflection and memory refinement
     │
-    ├── models/                 # Model Management (M4 24GB Logic)
-    │   ├── manager.py          # The JIT swapper (`gc.collect()`, `mx.metal.clear_cache()`)
-    │   ├── supervisor.py       # Qwen3-8B-DWQ initialization and structured output parsing
-    │   ├── coder.py            # Qwen3-Coder integration
-    │   └── vision.py           # Qwen3-VL integration
+    ├── models/                 # Model & MLX Runtime Management
+    │   ├── manager.py          # Weight loading and Metal cache maintenance
+    │   ├── supervisor.py       # Qwen3-8B orchestration & router
+    │   ├── coder.py            # Qwen2.5-Coder-3B execution wrapper
+    │   └── vision.py           # Qwen3-VL-4B multimodal wrapper
     │
-    ├── tools/                  # Tool Calling & External connections
-    │   └── mcp_client.py       # Connects LangGraph to your local MCP Servers
+    ├── tools/                  # Tool Execution Layer
+    │   ├── mcp_client.py       # Client interface to local MCP servers
+    │   ├── web_reader.py       # Trafilatura HTML & image metadata extractor
+    │   └── workspace.py        # Safe inspection tools (view_file, grep, diff proposal)
     │
-    ├── pipeline/               # Pre-processing (Runs before LLM sees prompt)
-    │   ├── normalizer.py       # fastText language ID & translation routing
-    │   └── slang.py            # ChromaDB lookup for Singlish/internet slang
+    ├── pipeline/               # Pre-processing & Normalization
+    │   ├── normalizer.py       # Language ID & translation routing
+    │   └── slang.py            # Vector mapping for colloquial abbreviations
     │
-    └── interfaces/             # UX / UI Layer
-        ├── cli.py              # `rich` terminal UI (Claude Code style)
-        ├── web.py              # `gradio` chatbot UI (Drag-and-drop images)
-        └── tauri_app/          # (Optional) Desktop app wrapper configuration
+    └── interfaces/             # User Interaction Layer
+        ├── cli.py              # Interactive terminal workspace (`rich`)
+        ├── web.py              # Multimodal browser interface (`gradio`)
+        └── tauri_app/          # Desktop dock wrapper configuration
 ```
 
 ---
 
-## 8. Cognitive Memory Hierarchy
+## 5. Tool Definitions & Security Boundaries
 
-F.R.E.D. implements a tiered memory system to decouple context from reasoning, ensuring the Supervisor's 8K context window remains lean and latency stays low.
+### Personal Context & Communications
 
-### 8.1 Short-Term Memory (Working Memory)
+- `read_gmail_inbox` / `get_email_thread`: Read-only OAuth2 access (`gmail.readonly`) returning structured JSON.
+- `read_calendar_events`: Read-only Google Calendar agenda checking.
+- `read_telegram_messages`: Read-only message retrieval via Telethon.
+- `draft_communication` / `propose_calendar_event`: Prepares payload proposals; strictly non-executable without explicit human approval.
 
-- **Sliding Window + Rolling Summary:**
-  Raw chat history is strictly capped at the last $N$ turns (e.g., 6 messages). Older messages are not deleted; they are compressed via a background prompt into a dense `working_summary` string that is prepended to the system prompt.
-- **Agentic Scratchpad:**
-  The LangGraph state maintains a `task_plan` (Supervisor's step-by-step strategy) and a `scratchpad` (internal notes on failed tool executions) to prevent cyclical hallucination loops.
+### Web & Scraped Content
 
-### 8.2 Long-Term Memory (LTM)
+- `read_web_page`: Trafilatura-based static text and image extractor with Playwright fallback for dynamic sites.
+- `search_web_duckduckgo` / `search_web_tavily`: Reasoning-gated web searches, logged and hop-capped.
 
-LTM is not automatically injected (to prevent context bloat). It is accessed via **Agentic Retrieval** (explicit tool calls by the Supervisor).
+### Local Workspace (Read-Only & Diff Proposals)
 
-- **Semantic Memory (Facts):** Stored in a ChromaDB collection (`semantic_kb`). Retrieved via `query_facts()`. Uses **Time-Weighted Vector Retrieval** to prioritize semantic relevance combined with a recency decay penalty, ensuring F.R.E.D. favors the latest version of a fact.
-- **Episodic Memory (Experience):** Powered by LangGraph's native `SqliteSaver`. Captures full conversational states allowing users to say, "Resume what we were working on yesterday."
-- **Procedural Memory (Skills):** Stored in `fred/memory/playbooks/` as Markdown. When the Coder agent figures out a complex terminal setup, it synthesizes the steps into a playbook. Retrieved via `query_playbooks()`.
+- `view_file` & `list_directory`: Local source file inspection.
+- `search_files_grep`: Targeted regular expression search across project paths.
+- `propose_code_diff`: Outputs standard unified diffs; direct disk write APIs are withheld.
+- `execute_safe_command`: Strictly whitelisted terminal evaluation (`pytest`, `ruff check`, `git status`, `git diff`).
 
-### 8.3 Continuous Learning Loop
+---
 
-F.R.E.D. runs a background **Memory Consolidation Node** after a task completes. It extracts new entities, corrects outdated information, and executes `insert_fact` or `delete_fact` tool calls against ChromaDB to refine its own knowledge base independently of user interaction.
+## 6. Omnichannel Interfaces
+
+- **Workspace CLI (`uv run fred.py --mode cli`):** Terminal UI powered by `rich`, featuring streaming reasoning tokens, formatted diff reviews, and execution logs.
+- **Multimodal Web App (`uv run fred.py --mode web`):** Local Gradio application with file and image drag-and-drop support for UI mocks and screenshots.
+- **Desktop App Wrapper (`uv run fred.py --mode app`):** Persistent macOS desktop integration via a lightweight Tauri wrapper.
+
+---
+
+## 7. Phased Implementation Roadmap
+
+1. **Phase 1 — Model Sandbox & Hardware Validation:**  
+   Implement `fred/models/manager.py` using `mlx-lm` and `mlx-vlm`. Verify that loading `Qwen3-8B`, `Qwen3-VL-4B`, and `Qwen2.5-Coder-3B` remains within the memory budget and releases Metal allocations cleanly.
+2. **Phase 2 — Core Graph Skeleton & ReAct Tier:**  
+   Construct the base LangGraph state machine with the Supervisor model. Wire the `read_gmail` tool and verify structured JSON output end-to-end.
+3. **Phase 3 — Multi-Tier Graph Routing:**  
+   Implement the Tier 2 Plan-and-Execute DAG (wiring `read_web_page`) and Tier 3 Reflexion loop for the Coder agent with automated lint checking.
+4. **Phase 4 — Cognitive Memory Integration:**  
+   Deploy the sliding window summarizer, connect ChromaDB for time-weighted fact retrieval, and configure the SQLite checkpointer.
+5. **Phase 5 — Omnichannel UI:**  
+   Hook up the `rich` CLI and `gradio` web interfaces to the compiled graph.
+6. **Phase 6 — HITL & Security Audit:**  
+   Verify that external write actions cannot bypass human approval and ensure immutable SQLite logging across all tool calls.

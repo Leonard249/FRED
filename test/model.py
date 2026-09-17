@@ -1,7 +1,9 @@
 from mlx_lm import load, generate
 
 # model_name = 
-# reasoning model -> "mlx-community/Qwen2.5-7B-Instruct-1M-8bit"
+# reasoning model -> mlx-community/Qwen3-8B-4bit-DWQ-053125
+# VLM -> mlx-community/Qwen3-VL-4B-Instruct-5bit
+# coding model -> mlx-community/Qwen2.5-Coder-3B-Instruct-8bit
 model_name = input("Please give a model path from mlx: ")
 
 model, tokenizer = load(model_name)
